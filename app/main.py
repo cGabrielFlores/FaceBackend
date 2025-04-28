@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from insightface.model_zoo import get_model
+from insightface.app import FaceAnalysis
 from supabase import create_client, Client
 import cv2
 
