@@ -37,12 +37,17 @@ supabase: Client = create_client(supabase_url, supabase_key)
 # Inicializar o modelo de embedding (sem detector)
 face_embedder = None
 
-@app.on_event("startup")
+@@app.on_event("startup")
 async def startup_event():
-    global face_embedder
-    # Carregar só o embedder
-    face_embedder = get_model("buffalo_l", download=True)
-    face_embedder.prepare(ctx_id=0)  # 0 = CPU
+    global face_analyzer
+    # Inicializar o modelo InsightFace com buffalo_l
+    try:
+        face_analyzer = FaceAnalysis(name="buffalo_l")
+        face_analyzer.prepare(ctx_id=0, det_size=(640, 640))
+    except Exception as e:
+        print(f"Erro ao inicializar o modelo InsightFace: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao inicializar o modelo InsightFace")
+
 
 @app.get("/")
 async def root():
