@@ -7,8 +7,7 @@ from typing import List
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import insightface
-from insightface.app import FaceAnalysis
+from insightface.model_zoo import get_model
 from supabase import create_client, Client
 import cv2
 
@@ -20,10 +19,10 @@ app = FastAPI(title="Face Recognition API")
 # Configurar CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Permitir todas as origens
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Permitir todos os métodos
-    allow_headers=["*"],  # Permitir todos os headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Inicializar Supabase
@@ -35,19 +34,30 @@ if not supabase_url or not supabase_key:
 
 supabase: Client = create_client(supabase_url, supabase_key)
 
-# Inicializar o modelo do InsightFace
-face_analyzer = None
+# Inicializar o modelo de embedding (sem detector)
+face_embedder = None
 
 @app.on_event("startup")
 async def startup_event():
-    global face_analyzer
-    # Inicializar o modelo InsightFace com buffalo_l
-    face_analyzer = FaceAnalysis(name="buffalo_l")
-    face_analyzer.prepare(ctx_id=0, det_size=(640, 640))
+    global face_embedder
+    # Carregar só o embedder
+    face_embedder = get_model("buffalo_l", download=True)
+    face_embedder.prepare(ctx_id=0)  # 0 = CPU
 
 @app.get("/")
 async def root():
     return {"message": "Face Recognition API está ativa", "version": "1.0.0"}
+
+def detect_face_opencv(img):
+    """Detecta o rosto usando Haar Cascade do OpenCV (super leve)."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+    if len(faces) == 0:
+        return None
+    x, y, w, h = faces[0]
+    face_crop = img[y:y+h, x:x+w]
+    return face_crop
 
 @app.post("/extract-embedding")
 async def extract_embedding(files: List[UploadFile] = File(...)):
@@ -57,7 +67,6 @@ async def extract_embedding(files: List[UploadFile] = File(...)):
     results = []
     
     for file in files:
-        # Ler a imagem
         contents = await file.read()
         image_array = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
@@ -70,10 +79,10 @@ async def extract_embedding(files: List[UploadFile] = File(...)):
             })
             continue
         
-        # Detectar rosto
-        faces = face_analyzer.get(img)
+        # Detectar rosto usando OpenCV
+        face_crop = detect_face_opencv(img)
         
-        if not faces:
+        if face_crop is None:
             results.append({
                 "filename": file.filename,
                 "status": "error",
@@ -81,43 +90,37 @@ async def extract_embedding(files: List[UploadFile] = File(...)):
             })
             continue
         
-        # Pegar apenas o primeiro rosto
-        face = faces[0]
+        # Redimensionar o rosto para 112x112 (o InsightFace espera isso)
+        face_crop = cv2.resize(face_crop, (112, 112))
         
-        # Extrair embedding (vetor facial)
-        embedding = face.embedding.tolist()
+        # Extrair embedding
+        embedding = face_embedder.get(face_crop).tolist()
         
-        # Gerar um nome único para o arquivo
+        # Gerar nome único
         file_extension = os.path.splitext(file.filename)[1]
         unique_filename = f"{uuid.uuid4()}{file_extension}"
-        
-        # Extrair o nome do arquivo (sem extensão)
         file_name_without_ext = os.path.splitext(file.filename)[0]
         
-        # Fazer upload da imagem para o Supabase
+        # Upload da imagem para Supabase
         upload_path = f"faces/{unique_filename}"
-        
-        # Resetar o cursor do arquivo para o início
         file_stream = io.BytesIO(contents)
         
-        # Upload para o bucket do Supabase
         storage_response = supabase.storage.from_("faces").upload(
             path=upload_path,
             file=file_stream,
             file_options={"content-type": file.content_type}
         )
         
-        # Obter a URL pública da imagem
+        # Obter a URL pública
         public_url = supabase.storage.from_("faces").get_public_url(upload_path)
         
-        # Salvar no banco de dados
+        # Salvar no banco
         db_response = supabase.table("faces").insert({
             "image_url": public_url,
             "embedding": embedding,
-            "name": file_name_without_ext  # Adicionando o nome extraído do arquivo
+            "name": file_name_without_ext
         }).execute()
         
-        # Adicionar ao resultado
         results.append({
             "filename": file.filename,
             "status": "success",
@@ -130,7 +133,6 @@ async def extract_embedding(files: List[UploadFile] = File(...)):
 
 @app.post("/compare")
 async def compare_faces(file: UploadFile = File(...)):
-    # Ler a imagem
     contents = await file.read()
     image_array = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
@@ -139,49 +141,41 @@ async def compare_faces(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Formato de arquivo não suportado")
     
     # Detectar rosto
-    faces = face_analyzer.get(img)
+    face_crop = detect_face_opencv(img)
     
-    if not faces:
+    if face_crop is None:
         raise HTTPException(status_code=400, detail="Nenhum rosto detectado na imagem")
     
-    # Pegar apenas o primeiro rosto
-    face = faces[0]
+    # Redimensionar para 112x112
+    face_crop = cv2.resize(face_crop, (112, 112))
     
     # Extrair embedding
-    query_embedding = face.embedding
+    query_embedding = face_embedder.get(face_crop)
     
-    # Buscar todos os embeddings do banco
+    # Buscar embeddings salvos
     response = supabase.table("faces").select("*").execute()
     stored_faces = response.data
     
     if not stored_faces:
         return {"matches": [], "message": "Nenhuma face armazenada para comparação"}
     
-    # Calcular distâncias euclidianas
     similarities = []
     
     for stored_face in stored_faces:
         stored_embedding = np.array(stored_face["embedding"])
-        
-        # Calcular distância euclidiana
         distance = np.linalg.norm(query_embedding - stored_embedding)
-        
-        # Converter para similaridade (quanto menor a distância, maior a similaridade)
         similarity = (1 - distance) * 100
         if similarity < 0:
             similarity = 0
-        
         similarities.append({
             "image_url": stored_face["image_url"],
             "similarity": similarity,
             "id": stored_face.get("id"),
-            "name": stored_face.get("name")  # Incluindo o nome na resposta
+            "name": stored_face.get("name")
         })
     
-    # Ordenar por similaridade (decrescente)
     similarities.sort(key=lambda x: x["similarity"], reverse=True)
     
-    # Retornar as 5 mais similares
     top_matches = similarities[:5]
     
     return {
