@@ -37,7 +37,7 @@ supabase: Client = create_client(supabase_url, supabase_key)
 # Inicializar o modelo de embedding (sem detector)
 face_embedder = None
 
-@@app.on_event("startup")
+@app.on_event("startup")
 async def startup_event():
     global face_analyzer
     # Inicializar o modelo InsightFace com buffalo_l
